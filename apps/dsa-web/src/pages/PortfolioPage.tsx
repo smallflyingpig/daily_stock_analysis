@@ -205,6 +205,8 @@ const PortfolioPage: React.FC = () => {
   const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
 
+  const eventSectionRef = useRef<HTMLDivElement>(null);
+
   const [tradeForm, setTradeForm] = useState({
     symbol: '',
     tradeDate: getTodayIso(),
@@ -574,20 +576,21 @@ const PortfolioPage: React.FC = () => {
   };
 
   const openDeleteDialog = (item: PendingDelete) => {
-    if (!writableAccountId) {
-      setWriteWarning('请先在右上角选择具体账户，再进行删除修正。');
-      return;
-    }
     setPendingDelete(item);
+  };
+
+  const scrollToTradesBySymbol = (symbol: string) => {
+    setEventType('trade');
+    setEventSymbol(symbol);
+    setEventPage(1);
+    // Scroll to event section
+    setTimeout(() => {
+      eventSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 100);
   };
 
   const handleConfirmDelete = async () => {
     if (!pendingDelete || deleteLoading) return;
-    if (!writableAccountId) {
-      setWriteWarning('请先在右上角选择具体账户，再进行删除修正。');
-      setPendingDelete(null);
-      return;
-    }
 
     const nextPage = currentEventCount === 1 && eventPage > 1 ? eventPage - 1 : eventPage;
     try {
@@ -969,7 +972,8 @@ const PortfolioPage: React.FC = () => {
                     <th className="text-right py-2 pr-2">均价</th>
                     <th className="text-right py-2 pr-2">现价</th>
                     <th className="text-right py-2 pr-2">市值</th>
-                    <th className="text-right py-2">未实现盈亏</th>
+                    <th className="text-right py-2 pr-2">未实现盈亏</th>
+                    <th className="text-right py-2">操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -981,8 +985,17 @@ const PortfolioPage: React.FC = () => {
                       <td className="py-2 pr-2 text-right">{row.avgCost.toFixed(4)}</td>
                       <td className="py-2 pr-2 text-right">{row.lastPrice.toFixed(4)}</td>
                       <td className="py-2 pr-2 text-right">{formatMoney(row.marketValueBase, row.valuationCurrency)}</td>
-                      <td className={`py-2 text-right ${row.unrealizedPnlBase >= 0 ? 'text-success' : 'text-danger'}`}>
+                      <td className={`py-2 pr-2 text-right ${row.unrealizedPnlBase >= 0 ? 'text-success' : 'text-danger'}`}>
                         {formatMoney(row.unrealizedPnlBase, row.valuationCurrency)}
+                      </td>
+                      <td className="py-2 text-right">
+                        <button
+                          type="button"
+                          className="btn-secondary !px-2 !py-1 !text-[11px]"
+                          onClick={() => scrollToTradesBySymbol(row.symbol)}
+                        >
+                          查看交易
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -1195,8 +1208,9 @@ const PortfolioPage: React.FC = () => {
           </div>
         </Card>
 
-        <Card padding="md">
-          <h3 className="text-sm font-semibold text-foreground mb-3">事件记录</h3>
+        <div ref={eventSectionRef}>
+          <Card padding="md">
+            <h3 className="text-sm font-semibold text-foreground mb-3">事件记录</h3>
           <div className="space-y-2">
             <div className="grid grid-cols-2 gap-2">
               <select className={PORTFOLIO_SELECT_CLASS} value={eventType} onChange={(e) => setEventType(e.target.value as EventType)}>
@@ -1240,7 +1254,7 @@ const PortfolioPage: React.FC = () => {
               </select>
             ) : null}
             <div className="text-[11px] text-secondary">
-              {writeBlocked ? '删除修正仅在单账户视图可用。请先选择具体账户后再删除错误流水。' : '如有错误流水，可直接删除后重新录入。'}
+              如有错误流水，可直接删除后重新录入。
             </div>
             <div className="max-h-64 overflow-auto rounded-lg border border-white/10 p-2">
               {eventType === 'trade' && tradeEvents.map((item) => (
@@ -1248,19 +1262,17 @@ const PortfolioPage: React.FC = () => {
                   <div className="min-w-0">
                     {item.tradeDate} {formatSideLabel(item.side)} {item.symbol} 数量={item.quantity} 价格={item.price}
                   </div>
-                  {!writeBlocked ? (
-                    <button
-                      type="button"
-                      className="btn-secondary shrink-0 !px-3 !py-1 !text-[11px]"
-                      onClick={() => openDeleteDialog({
-                        eventType: 'trade',
-                        id: item.id,
-                        message: `确认删除 ${item.tradeDate} 的${formatSideLabel(item.side)}流水 ${item.symbol}（数量 ${item.quantity}，价格 ${item.price}）吗？`,
-                      })}
-                    >
-                      删除
-                    </button>
-                  ) : null}
+                  <button
+                    type="button"
+                    className="btn-secondary shrink-0 !px-3 !py-1 !text-[11px]"
+                    onClick={() => openDeleteDialog({
+                      eventType: 'trade',
+                      id: item.id,
+                      message: `确认删除 ${item.tradeDate} 的${formatSideLabel(item.side)}流水 ${item.symbol}（数量 ${item.quantity}，价格 ${item.price}）吗？`,
+                    })}
+                  >
+                    删除
+                  </button>
                 </div>
               ))}
               {eventType === 'cash' && cashEvents.map((item) => (
@@ -1268,19 +1280,17 @@ const PortfolioPage: React.FC = () => {
                   <div className="min-w-0">
                     {item.eventDate} {formatCashDirectionLabel(item.direction)} {item.amount} {item.currency}
                   </div>
-                  {!writeBlocked ? (
-                    <button
-                      type="button"
-                      className="btn-secondary shrink-0 !px-3 !py-1 !text-[11px]"
-                      onClick={() => openDeleteDialog({
-                        eventType: 'cash',
-                        id: item.id,
-                        message: `确认删除 ${item.eventDate} 的资金流水（${formatCashDirectionLabel(item.direction)} ${item.amount} ${item.currency}）吗？`,
-                      })}
-                    >
-                      删除
-                    </button>
-                  ) : null}
+                  <button
+                    type="button"
+                    className="btn-secondary shrink-0 !px-3 !py-1 !text-[11px]"
+                    onClick={() => openDeleteDialog({
+                      eventType: 'cash',
+                      id: item.id,
+                      message: `确认删除 ${item.eventDate} 的资金流水（${formatCashDirectionLabel(item.direction)} ${item.amount} ${item.currency}）吗？`,
+                    })}
+                  >
+                    删除
+                  </button>
                 </div>
               ))}
               {eventType === 'corporate' && corporateEvents.map((item) => (
@@ -1288,19 +1298,17 @@ const PortfolioPage: React.FC = () => {
                   <div className="min-w-0">
                     {item.effectiveDate} {formatCorporateActionLabel(item.actionType)} {item.symbol}
                   </div>
-                  {!writeBlocked ? (
-                    <button
-                      type="button"
-                      className="btn-secondary shrink-0 !px-3 !py-1 !text-[11px]"
-                      onClick={() => openDeleteDialog({
-                        eventType: 'corporate',
-                        id: item.id,
-                        message: `确认删除 ${item.effectiveDate} 的公司行为 ${formatCorporateActionLabel(item.actionType)}（${item.symbol}）吗？`,
-                      })}
-                    >
-                      删除
-                    </button>
-                  ) : null}
+                  <button
+                    type="button"
+                    className="btn-secondary shrink-0 !px-3 !py-1 !text-[11px]"
+                    onClick={() => openDeleteDialog({
+                      eventType: 'corporate',
+                      id: item.id,
+                      message: `确认删除 ${item.effectiveDate} 的公司行为 ${formatCorporateActionLabel(item.actionType)}（${item.symbol}）吗？`,
+                    })}
+                  >
+                    删除
+                  </button>
                 </div>
               ))}
               {!eventLoading
@@ -1329,6 +1337,7 @@ const PortfolioPage: React.FC = () => {
             </div>
           </div>
         </Card>
+        </div>
       </section>
       <ConfirmDialog
         isOpen={Boolean(pendingDelete)}

@@ -76,7 +76,7 @@ def _invalid_analysis_input_error() -> HTTPException:
         status_code=400,
         detail={
             "error": "validation_error",
-            "message": "请输入有效的股票代码或股票名称",
+            "message": "请输入有效的股票代码。A股:6位数字(如600519), 港股:5位数字(如00700)或HK前缀(如HK00700), 美股:字母代码(如AAPL)",
         },
     )
 

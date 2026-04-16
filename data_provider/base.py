@@ -2266,13 +2266,66 @@ class DataFetcherManager:
         return result_ctx
 
     def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
-        """资金流向块（fail-open）。"""
+        """资金流向块（fail-open）。支持A股(akshare)和港股(Longbridge)。"""
         from src.config import get_config
 
         config = get_config()
         stock_code = normalize_stock_code(stock_code)
         timeout = float(budget_seconds if budget_seconds is not None else config.fundamental_fetch_timeout_seconds)
-        if _market_tag(stock_code) != "cn" or _is_etf_code(stock_code):
+        market = _market_tag(stock_code)
+
+        # ETF 不支持资金流向
+        if _is_etf_code(stock_code):
+            return self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["not supported"],
+            )
+
+        # 港股：使用 Longbridge 获取资金流向
+        if market == "hk":
+            longbridge = None
+            for fetcher in self._get_fetchers_snapshot():
+                if fetcher.name == "LongbridgeFetcher":
+                    longbridge = fetcher
+                    break
+            if longbridge is None or not longbridge._is_available():
+                return self._build_fundamental_block(
+                    "not_supported",
+                    {},
+                    [{"provider": "longbridge", "result": "not_available", "duration_ms": 0}],
+                    ["Longbridge credentials not configured"],
+                )
+            try:
+                hk_flow = longbridge.get_capital_flow(stock_code)
+                if hk_flow is None:
+                    return self._build_fundamental_block(
+                        "not_supported",
+                        {},
+                        [{"provider": "longbridge", "result": "no_data", "duration_ms": 0}],
+                        ["HK capital flow not available"],
+                    )
+                return self._build_fundamental_block(
+                    "ok",
+                    {
+                        "stock_flow": hk_flow,
+                        "sector_rankings": {},  # 港股暂无板块排名
+                    },
+                    [{"provider": "longbridge", "result": "ok", "duration_ms": 0}],
+                    [],
+                )
+            except Exception as e:
+                logger.warning(f"[DataFetcherManager] 港股资金流向获取失败: {e}")
+                return self._build_fundamental_block(
+                    "failed",
+                    {},
+                    [{"provider": "longbridge", "result": "failed", "duration_ms": 0}],
+                    [str(e)],
+                )
+
+        # A股：使用 akshare 获取资金流向
+        if market != "cn":
             return self._build_fundamental_block(
                 "not_supported",
                 {},

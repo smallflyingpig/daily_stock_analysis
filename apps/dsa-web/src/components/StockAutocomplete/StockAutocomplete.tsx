@@ -37,7 +37,7 @@ function FallbackInput({
   onChange,
   onSubmit,
   disabled = false,
-  placeholder = '输入股票代码或名称',
+  placeholder = '输入股票代码 (A股:600519, 港股:00700, 美股:AAPL)',
   className,
 }: StockAutocompleteProps) {
   return (
@@ -96,7 +96,7 @@ function StockAutocompleteInner({
   onChange,
   onSubmit,
   disabled = false,
-  placeholder = '输入股票代码或名称',
+  placeholder = '输入股票代码 (A股:600519, 港股:00700, 美股:AAPL)',
   className,
 }: StockAutocompleteProps) {
   const { index, loading, fallback } = useStockIndex();

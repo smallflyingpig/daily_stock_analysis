@@ -695,3 +695,94 @@ class LongbridgeFetcher(BaseFetcher):
                 df[col] = None
 
         return df[STANDARD_COLUMNS]
+
+    # ------------------------------------------------------------------
+    # HK Capital Flow (港股资金流向)
+    # ------------------------------------------------------------------
+
+    def get_capital_flow(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """
+        Get capital flow data for HK stocks via Longbridge API.
+
+        Longbridge provides intraday capital flow data for HK stocks,
+        which is not available through A-share-only data sources like akshare.
+
+        Args:
+            stock_code: Stock code (e.g., 'HK00700', '00700', '00700.HK')
+
+        Returns:
+            Dict with capital flow data, or None if not available:
+            - capital_in: Capital inflow amount
+            - capital_out: Capital outflow amount
+            - net_flow: Net capital flow (in - out)
+            - timestamp: Data timestamp
+            - source: "longbridge"
+
+        Note:
+            This method only works for HK stocks. US stocks should use
+            social sentiment data instead.
+        """
+        # Only support HK stocks (US stocks use social sentiment)
+        if not _is_hk_code(stock_code):
+            logger.debug(f"[Longbridge] get_capital_flow 只支持港股，跳过 {stock_code}")
+            return None
+
+        if not self._is_available():
+            logger.debug("[Longbridge] 凭证未配置，无法获取资金流向")
+            return None
+
+        symbol = _to_longbridge_symbol(stock_code)
+        if symbol is None:
+            logger.debug(f"[Longbridge] 无法转换港股代码: {stock_code}")
+            return None
+
+        ctx = self._get_ctx()
+        if ctx is None:
+            return None
+
+        try:
+            # Try capital_distribution first (has capital_in/capital_out)
+            resp = ctx.capital_distribution(symbol)
+            if resp is None:
+                return None
+
+            capital_in = safe_float(getattr(resp, "capital_in", None))
+            capital_out = safe_float(getattr(resp, "capital_out", None))
+            timestamp = getattr(resp, "timestamp", None)
+
+            if capital_in is None and capital_out is None:
+                logger.debug(f"[Longbridge] {symbol} 资金流向数据为空")
+                return None
+
+            # Calculate net flow
+            net_flow = None
+            if capital_in is not None and capital_out is not None:
+                net_flow = round(capital_in - capital_out, 2)
+
+            # Format timestamp
+            ts_str = ""
+            if timestamp is not None:
+                if hasattr(timestamp, "strftime"):
+                    ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    ts_str = str(timestamp)
+
+            result = {
+                "capital_in": capital_in,
+                "capital_out": capital_out,
+                "net_flow": net_flow,
+                "timestamp": ts_str,
+                "source": "longbridge",
+            }
+
+            logger.info(
+                f"[Longbridge] {symbol} 资金流向: 流入={capital_in}, 流出={capital_out}, 净流={net_flow}"
+            )
+            return result
+
+        except Exception as e:
+            logger.debug(f"[Longbridge] capital_distribution({symbol}) 失败: {e}")
+            if self._is_connection_error(e):
+                logger.warning("[Longbridge] 检测到连接已断开，将在下次调用时重建连接")
+                self._invalidate_ctx()
+            return None

@@ -26,7 +26,7 @@ import pandas as pd
 import numpy as np
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
-from .fundamental_adapter import AkshareFundamentalAdapter
+from .fundamental_adapter import AkshareFundamentalAdapter, YfinanceFundamentalAdapter, LongbridgeFundamentalAdapter, AkshareHKFundamentalAdapter
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -504,6 +504,9 @@ class DataFetcherManager:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
         self._fundamental_adapter = AkshareFundamentalAdapter()
+        self._yfinance_fundamental_adapter = YfinanceFundamentalAdapter()
+        self._longbridge_fundamental_adapter = LongbridgeFundamentalAdapter()
+        self._akshare_hk_fundamental_adapter = AkshareHKFundamentalAdapter()
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None
         self._tickflow_lock = RLock()
@@ -1982,11 +1985,14 @@ class DataFetcherManager:
         stock_code = normalize_stock_code(stock_code)
         market = _market_tag(stock_code)
         is_etf = _is_etf_code(stock_code)
-        if market in {"us", "hk"}:
-            return self._build_market_not_supported(
-                market=market,
-                reason="market not supported",
-            )
+
+        # Route to market-specific fundamental adapters
+        if market == "us":
+            return self._get_us_fundamental_context(stock_code, budget_seconds)
+        elif market == "hk":
+            return self._get_hk_fundamental_context(stock_code, budget_seconds)
+
+        # A-share logic continues below
 
         stage_timeout = float(
             budget_seconds if budget_seconds is not None else config.fundamental_stage_timeout_seconds
@@ -2263,6 +2269,297 @@ class DataFetcherManager:
                     "context": result_ctx,
                 }
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+        return result_ctx
+
+    def _get_us_fundamental_context(
+        self,
+        stock_code: str,
+        budget_seconds: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        US stock fundamental context via YFinance.
+        """
+        from src.config import get_config
+
+        config = get_config()
+        market = "us"
+
+        stage_timeout = float(
+            budget_seconds if budget_seconds is not None else config.fundamental_stage_timeout_seconds
+        )
+        stage_timeout = max(0.0, stage_timeout)
+        fetch_timeout = float(config.fundamental_fetch_timeout_seconds)
+        fetch_timeout = max(0.0, fetch_timeout)
+
+        cache_ttl = int(config.fundamental_cache_ttl_seconds)
+        cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
+        if cache_ttl > 0:
+            cache_max_entries = max(0, int(getattr(config, "fundamental_cache_max_entries", 256)))
+            self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+            with self._fundamental_cache_lock:
+                cache_item = self._fundamental_cache.get(cache_key)
+                if cache_item:
+                    age = time.time() - float(cache_item.get("ts", 0))
+                    if age <= cache_ttl:
+                        return cache_item.get("context", {})
+
+        start_ts = time.time()
+        result_ctx: Dict[str, Any] = {
+            "market": market,
+            "valuation": {},
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "capital_flow": {},
+            "dragon_tiger": {},
+            "boards": {},
+            "coverage": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        # Try YFinance fundamental adapter
+        bundle_timeout = min(fetch_timeout, stage_timeout)
+        bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+            lambda: self._yfinance_fundamental_adapter.get_fundamental_bundle(stock_code),
+            bundle_timeout,
+            "yfinance_fundamental_bundle",
+        )
+
+        if isinstance(bundle_payload, dict):
+            # Merge valuation
+            valuation_data = bundle_payload.get("valuation", {})
+            if valuation_data:
+                result_ctx["valuation"] = self._build_fundamental_block(
+                    "partial" if any(v is not None for v in valuation_data.values()) else "not_supported",
+                    valuation_data,
+                    [{"provider": "yfinance", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                    [bundle_err_msg] if bundle_err_msg else [],
+                )
+
+            # Merge growth
+            growth_data = bundle_payload.get("growth", {})
+            if growth_data:
+                result_ctx["growth"] = self._build_fundamental_block(
+                    "partial" if any(v is not None for v in growth_data.values()) else "not_supported",
+                    growth_data,
+                    [{"provider": "yfinance", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                    [],
+                )
+
+            # Merge earnings
+            earnings_data = bundle_payload.get("earnings", {})
+            if earnings_data:
+                result_ctx["earnings"] = self._build_fundamental_block(
+                    "partial" if earnings_data else "not_supported",
+                    earnings_data,
+                    [{"provider": "yfinance", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                    [],
+                )
+
+            result_ctx["source_chain"] = bundle_payload.get("source_chain", [])
+            if bundle_err_msg:
+                result_ctx["errors"].append(bundle_err_msg)
+        else:
+            result_ctx["errors"].append(bundle_err_msg or "yfinance_fundamental_bundle failed")
+
+        result_ctx["elapsed_ms"] = int((time.time() - start_ts) * 1000)
+        has_content = bool(result_ctx["valuation"] or result_ctx["growth"] or result_ctx["earnings"])
+        result_ctx["status"] = "partial" if has_content else "not_supported"
+
+        # Cache result
+        if cache_ttl > 0 and has_content:
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[cache_key] = {
+                    "ts": time.time(),
+                    "context": result_ctx,
+                }
+
+        return result_ctx
+
+    def _get_hk_fundamental_context(
+        self,
+        stock_code: str,
+        budget_seconds: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        HK stock fundamental context via AkShare (primary) + Longbridge + YFinance fallback.
+        """
+        from src.config import get_config
+
+        config = get_config()
+        market = "hk"
+
+        stage_timeout = float(
+            budget_seconds if budget_seconds is not None else config.fundamental_stage_timeout_seconds
+        )
+        stage_timeout = max(0.0, stage_timeout)
+        fetch_timeout = float(config.fundamental_fetch_timeout_seconds)
+        fetch_timeout = max(0.0, fetch_timeout)
+
+        cache_ttl = int(config.fundamental_cache_ttl_seconds)
+        cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
+        if cache_ttl > 0:
+            cache_max_entries = max(0, int(getattr(config, "fundamental_cache_max_entries", 256)))
+            self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+            with self._fundamental_cache_lock:
+                cache_item = self._fundamental_cache.get(cache_key)
+                if cache_item:
+                    age = time.time() - float(cache_item.get("ts", 0))
+                    if age <= cache_ttl:
+                        return cache_item.get("context", {})
+
+        start_ts = time.time()
+        result_ctx: Dict[str, Any] = {
+            "market": market,
+            "valuation": {},
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "capital_flow": {},
+            "dragon_tiger": {},
+            "boards": {},
+            "coverage": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        # Try AkShare HK first (most reliable for HK fundamentals)
+        bundle_timeout = min(fetch_timeout, stage_timeout)
+        bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+            lambda: self._akshare_hk_fundamental_adapter.get_fundamental_bundle(stock_code),
+            bundle_timeout,
+            "akshare_hk_fundamental_bundle",
+        )
+
+        if isinstance(bundle_payload, dict) and bundle_payload.get("status") != "not_supported":
+            # Merge valuation
+            valuation_data = bundle_payload.get("valuation", {})
+            if valuation_data:
+                result_ctx["valuation"] = self._build_fundamental_block(
+                    "partial" if any(v is not None for v in valuation_data.values()) else "not_supported",
+                    valuation_data,
+                    [{"provider": "akshare_hk", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                    [],
+                )
+
+            # Merge growth
+            growth_data = bundle_payload.get("growth", {})
+            if growth_data:
+                result_ctx["growth"] = self._build_fundamental_block(
+                    "partial" if any(v is not None for v in growth_data.values()) else "not_supported",
+                    growth_data,
+                    [{"provider": "akshare_hk", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                    [],
+                )
+
+            # Merge earnings
+            earnings_data = bundle_payload.get("earnings", {})
+            if earnings_data:
+                result_ctx["earnings"] = self._build_fundamental_block(
+                    "partial" if earnings_data else "not_supported",
+                    earnings_data,
+                    [{"provider": "akshare_hk", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                    [],
+                )
+
+            result_ctx["source_chain"] = bundle_payload.get("source_chain", [])
+            if bundle_err_msg:
+                result_ctx["errors"].append(bundle_err_msg)
+
+        # Fallback to Longbridge if AkShare didn't provide enough data
+        has_content = bool(result_ctx["valuation"] or result_ctx["growth"] or result_ctx["earnings"])
+        if not has_content and self._longbridge_fundamental_adapter.available:
+            remaining_seconds = stage_timeout - (time.time() - start_ts)
+            if remaining_seconds > 0:
+                bundle_timeout = min(fetch_timeout, remaining_seconds)
+                bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+                    lambda: self._longbridge_fundamental_adapter.get_fundamental_bundle(stock_code),
+                    bundle_timeout,
+                    "longbridge_fundamental_bundle",
+                )
+
+                if isinstance(bundle_payload, dict) and bundle_payload.get("status") != "not_supported":
+                    valuation_data = bundle_payload.get("valuation", {})
+                    if valuation_data:
+                        result_ctx["valuation"] = self._build_fundamental_block(
+                            "partial" if any(v is not None for v in valuation_data.values()) else "not_supported",
+                            valuation_data,
+                            [{"provider": "longbridge", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                            [],
+                        )
+
+                    growth_data = bundle_payload.get("growth", {})
+                    if growth_data:
+                        result_ctx["growth"] = self._build_fundamental_block(
+                            "partial" if any(v is not None for v in growth_data.values()) else "not_supported",
+                            growth_data,
+                            [{"provider": "longbridge", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                            [],
+                        )
+
+                    result_ctx["source_chain"].extend(bundle_payload.get("source_chain", []))
+                    if bundle_err_msg:
+                        result_ctx["errors"].append(bundle_err_msg)
+
+        # Update has_content after Longbridge attempt
+        has_content = bool(result_ctx["valuation"] or result_ctx["growth"] or result_ctx["earnings"])
+
+        # Fallback to YFinance if still no data
+        if not has_content and stage_timeout > 0:
+            remaining_seconds = stage_timeout - (time.time() - start_ts)
+            if remaining_seconds > 0:
+                bundle_timeout = min(fetch_timeout, remaining_seconds)
+                bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+                    lambda: self._yfinance_fundamental_adapter.get_fundamental_bundle(stock_code),
+                    bundle_timeout,
+                    "yfinance_fundamental_bundle",
+                )
+
+                if isinstance(bundle_payload, dict):
+                    valuation_data = bundle_payload.get("valuation", {})
+                    if valuation_data:
+                        result_ctx["valuation"] = self._build_fundamental_block(
+                            "partial" if any(v is not None for v in valuation_data.values()) else "not_supported",
+                            valuation_data,
+                            [{"provider": "yfinance", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                            [],
+                        )
+
+                    growth_data = bundle_payload.get("growth", {})
+                    if growth_data:
+                        result_ctx["growth"] = self._build_fundamental_block(
+                            "partial" if any(v is not None for v in growth_data.values()) else "not_supported",
+                            growth_data,
+                            [{"provider": "yfinance", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                            [],
+                        )
+
+                    earnings_data = bundle_payload.get("earnings", {})
+                    if earnings_data:
+                        result_ctx["earnings"] = self._build_fundamental_block(
+                            "partial" if earnings_data else "not_supported",
+                            earnings_data,
+                            [{"provider": "yfinance", "result": bundle_payload.get("status", "partial"), "duration_ms": bundle_ms}],
+                            [],
+                        )
+
+                    result_ctx["source_chain"].extend(bundle_payload.get("source_chain", []))
+                    if bundle_err_msg:
+                        result_ctx["errors"].append(bundle_err_msg)
+
+        result_ctx["elapsed_ms"] = int((time.time() - start_ts) * 1000)
+        has_content = bool(result_ctx["valuation"] or result_ctx["growth"] or result_ctx["earnings"])
+        result_ctx["status"] = "partial" if has_content else "not_supported"
+
+        # Cache result
+        if cache_ttl > 0 and has_content:
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[cache_key] = {
+                    "ts": time.time(),
+                    "context": result_ctx,
+                }
+
         return result_ctx
 
     def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:

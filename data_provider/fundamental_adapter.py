@@ -9,7 +9,10 @@ endpoint candidates. It should never raise to caller; partial data is allowed.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -530,3 +533,445 @@ class AkshareFundamentalAdapter:
         result["status"] = "ok"
         result["source_chain"].append(f"dragon_tiger:{source}")
         return result
+
+
+# ----------------------------------------------------------------------
+# YFinance Fundamental Adapter (US stocks)
+# ----------------------------------------------------------------------
+
+class YfinanceFundamentalAdapter:
+    """YFinance adapter for US/HK stock fundamentals using ticker.info."""
+
+    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+        """
+        Return normalized fundamental blocks from YFinance ticker.info.
+
+        Supports US stocks with comprehensive financial metrics.
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "valuation": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        # Normalize code for YFinance (AAPL stays AAPL, HK needs .HK suffix)
+        symbol = self._normalize_yfinance_symbol(stock_code)
+
+        try:
+            import yfinance as yf
+        except Exception as exc:
+            result["errors"].append(f"import_yfinance:{type(exc).__name__}")
+            return result
+
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            if not info:
+                result["errors"].append("ticker.info_empty")
+                return result
+        except Exception as exc:
+            result["errors"].append(f"ticker.info:{type(exc).__name__}")
+            return result
+
+        # Extract valuation metrics
+        pe_ratio = _safe_float(info.get("trailingPE") or info.get("forwardPE"))
+        pb_ratio = _safe_float(info.get("priceToBook"))
+        market_cap = _safe_float(info.get("marketCap"))
+
+        result["valuation"] = {
+            "pe_ratio": pe_ratio,
+            "pb_ratio": pb_ratio,
+            "total_mv": market_cap,
+        }
+        result["source_chain"].append("valuation:yfinance_info")
+
+        # Extract growth metrics
+        revenue = _safe_float(info.get("totalRevenue"))
+        net_income = _safe_float(info.get("netIncomeToCommon"))
+        operating_cash_flow = _safe_float(info.get("operatingCashflow"))
+        roe = _safe_float(info.get("returnOnEquity"))
+        profit_margin = _safe_float(info.get("profitMargins"))
+        gross_margin = _safe_float(info.get("grossMargins"))
+        revenue_growth = _safe_float(info.get("revenueGrowth"))
+        earnings_growth = _safe_float(info.get("earningsGrowth"))
+
+        result["growth"] = {
+            "revenue_yoy": revenue_growth,
+            "net_profit_yoy": earnings_growth,
+            "roe": roe,
+            "gross_margin": gross_margin,
+            "profit_margin": profit_margin,
+        }
+
+        # Extract financial report
+        financial_report_payload = {
+            "revenue": revenue,
+            "net_profit_parent": net_income,
+            "operating_cash_flow": operating_cash_flow,
+            "roe": roe,
+        }
+        if any(v is not None for v in financial_report_payload.values()):
+            result["earnings"]["financial_report"] = financial_report_payload
+
+        # Extract dividend metrics
+        dividend_rate = _safe_float(info.get("dividendRate"))
+        dividend_yield = _safe_float(info.get("dividendYield"))
+        if dividend_rate is not None:
+            # dividendRate is annual dividend per share
+            dividend_payload = {
+                "ttm_cash_dividend_per_share": dividend_rate,
+                "ttm_dividend_yield_pct": dividend_yield * 100 if dividend_yield is not None else None,
+                "ttm_event_count": 1 if dividend_rate > 0 else 0,
+                "coverage": "annual_dividend",
+            }
+            result["earnings"]["dividend"] = dividend_payload
+            result["source_chain"].append("dividend:yfinance_info")
+
+        # Determine status
+        has_content = bool(result["valuation"] or result["growth"] or result["earnings"])
+        result["status"] = "partial" if has_content else "not_supported"
+
+        return result
+
+    def _normalize_yfinance_symbol(self, stock_code: str) -> str:
+        """Normalize stock code for YFinance API."""
+        code = _safe_str(stock_code).upper()
+        # Remove HK prefix if present
+        if code.startswith("HK"):
+            code = code[2:]
+        # Add .HK suffix for HK stocks (5-digit codes)
+        if re.match(r"^\d{5}$", code):
+            return f"{code}.HK"
+        # US stocks stay as-is (AAPL, TSLA, etc.)
+        return code
+
+
+# ----------------------------------------------------------------------
+# Longbridge Fundamental Adapter (HK stocks)
+# ----------------------------------------------------------------------
+
+class LongbridgeFundamentalAdapter:
+    """Longbridge adapter for HK stock fundamentals using static_info."""
+
+    def __init__(self):
+        self._available = False
+        self._ctx = None
+        self._static_cache: Dict[str, Tuple[Any, float]] = {}
+        self._static_cache_lock = threading.Lock()
+        self._init_ctx()
+
+    def _init_ctx(self):
+        """Initialize Longbridge QuoteContext."""
+        try:
+            from longbridge.openapi import QuoteContext, Config
+
+            app_key = os.getenv("LONGBRIDGE_APP_KEY", "")
+            app_secret = os.getenv("LONGBRIDGE_APP_SECRET", "")
+            access_token = os.getenv("LONGBRIDGE_ACCESS_TOKEN", "")
+
+            if not all([app_key, app_secret, access_token]):
+                logger.debug("[LongbridgeFundamental] Missing credentials, adapter disabled")
+                self._available = False
+                return
+
+            lb_config = Config(
+                app_key=app_key,
+                app_secret=app_secret,
+                access_token=access_token,
+            )
+            self._ctx = QuoteContext(lb_config)
+            self._available = True
+            logger.info("[LongbridgeFundamental] QuoteContext initialized successfully")
+        except Exception as e:
+            logger.warning(f"[LongbridgeFundamental] Init failed: {e}")
+            self._available = False
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def _get_static_info(self, symbol: str) -> Optional[Any]:
+        """Get static info with TTL cache."""
+        ttl = int(os.getenv("LONGBRIDGE_STATIC_INFO_TTL_SECONDS", "86400"))
+        now = time.time()
+
+        if ttl > 0:
+            with self._static_cache_lock:
+                cached = self._static_cache.get(symbol)
+                if cached and (now - cached[1]) < ttl:
+                    return cached[0]
+
+        if self._ctx is None:
+            return None
+
+        try:
+            infos = self._ctx.static_info([symbol])
+            if infos:
+                info = infos[0]
+                if ttl > 0:
+                    with self._static_cache_lock:
+                        self._static_cache[symbol] = (info, now)
+                return info
+        except Exception as e:
+            logger.debug(f"[LongbridgeFundamental] static_info({symbol}) failed: {e}")
+
+        return None
+
+    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+        """
+        Return normalized fundamental blocks from Longbridge static_info.
+
+        Supports HK stocks with EPS, BPS, and derived PE/PB.
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "valuation": {},
+            "growth": {},
+            "earnings": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        if not self._available:
+            result["errors"].append("longbridge_not_available")
+            return result
+
+        # Normalize code for Longbridge (00700.HK format)
+        symbol = self._normalize_longbridge_symbol(stock_code)
+        if symbol is None:
+            result["errors"].append("invalid_hk_code")
+            return result
+
+        # Get static_info
+        info = self._get_static_info(symbol)
+        if info is None:
+            result["errors"].append("static_info_not_available")
+            return result
+
+        # Extract fundamental fields from static_info
+        eps_ttm = _safe_float(getattr(info, "eps_ttm", None))
+        bps = _safe_float(getattr(info, "bps", None))
+        total_shares = _safe_float(getattr(info, "total_shares", None))
+        circulating_shares = _safe_float(getattr(info, "circulating_shares", None))
+
+        # Get current price to calculate PE/PB
+        price = self._get_current_price(symbol)
+
+        # Calculate PE/PB from price and EPS/BPS
+        pe_ratio = None
+        pb_ratio = None
+        if price is not None and price > 0:
+            if eps_ttm is not None and eps_ttm > 0:
+                pe_ratio = round(price / eps_ttm, 2)
+            if bps is not None and bps > 0:
+                pb_ratio = round(price / bps, 2)
+
+        # Calculate market cap
+        total_mv = None
+        circ_mv = None
+        if price is not None and price > 0:
+            if total_shares is not None:
+                total_mv = price * total_shares
+            if circulating_shares is not None:
+                circ_mv = price * circulating_shares
+
+        result["valuation"] = {
+            "pe_ratio": pe_ratio,
+            "pb_ratio": pb_ratio,
+            "eps_ttm": eps_ttm,
+            "bps": bps,
+            "total_mv": total_mv,
+            "circ_mv": circ_mv,
+        }
+        result["source_chain"].append("valuation:longbridge_static_info")
+
+        # ROE estimate (EPS / BPS)
+        if eps_ttm is not None and bps is not None and bps > 0:
+            result["growth"]["roe"] = round(eps_ttm / bps, 4)
+
+        # Determine status
+        has_content = bool(result["valuation"] or result["growth"])
+        result["status"] = "partial" if has_content else "not_supported"
+
+        return result
+
+    def _normalize_longbridge_symbol(self, stock_code: str) -> Optional[str]:
+        """Normalize stock code for Longbridge API (HK stocks only)."""
+        code = _safe_str(stock_code).upper()
+        # Remove HK prefix
+        if code.startswith("HK"):
+            code = code[2:]
+        # Must be 5-digit HK stock code
+        if not re.match(r"^\d{5}$", code):
+            return None
+        return f"{code}.HK"
+
+    def _get_current_price(self, symbol: str) -> Optional[float]:
+        """Get current price from Longbridge quote."""
+        if self._ctx is None:
+            return None
+        try:
+            quotes = self._ctx.quote([symbol])
+            if quotes:
+                quote = quotes[0]
+                return _safe_float(getattr(quote, "last_done", None))
+        except Exception as e:
+            logger.debug(f"[LongbridgeFundamental] quote({symbol}) failed: {e}")
+        return None
+
+
+# ----------------------------------------------------------------------
+# AkShare HK Fundamental Adapter (HK stocks)
+# ----------------------------------------------------------------------
+
+class AkshareHKFundamentalAdapter:
+    """AkShare adapter for HK stock fundamentals using HK financial APIs."""
+
+    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+        """
+        Return normalized fundamental blocks from AkShare HK APIs.
+
+        Uses stock_financial_hk_analysis_indicator_em for financial metrics.
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "valuation": {},
+            "growth": {},
+            "earnings": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        # Normalize HK stock code (5-digit)
+        symbol = self._normalize_hk_code(stock_code)
+        if symbol is None:
+            result["errors"].append("invalid_hk_code")
+            return result
+
+        try:
+            import akshare as ak
+        except Exception as exc:
+            result["errors"].append(f"import_akshare:{type(exc).__name__}")
+            return result
+
+        # Try to get HK financial analysis indicator
+        try:
+            df = ak.stock_financial_hk_analysis_indicator_em(symbol=symbol)
+            if df is not None and not df.empty:
+                # Get the latest row (first row is most recent)
+                row = df.iloc[0]
+
+                # Extract key metrics
+                eps_ttm = _safe_float(row.get("EPS_TTM"))
+                basic_eps = _safe_float(row.get("BASIC_EPS"))
+                bps = _safe_float(row.get("BPS"))
+                roe_avg = _safe_float(row.get("ROE_AVG"))
+                roe_yearly = _safe_float(row.get("ROE_YEARLY"))
+                operate_income = _safe_float(row.get("OPERATE_INCOME"))  # 营业收入
+                holder_profit = _safe_float(row.get("HOLDER_PROFIT"))  # 归母净利润
+                gross_profit_ratio = _safe_float(row.get("GROSS_PROFIT_RATIO"))  # 毛利率
+                operate_income_yoy = _safe_float(row.get("OPERATE_INCOME_YOY"))  # 营收同比
+                holder_profit_yoy = _safe_float(row.get("HOLDER_PROFIT_YOY"))  # 净利润同比
+                report_date = _normalize_report_date(row.get("REPORT_DATE"))
+
+                # Build valuation payload
+                result["valuation"] = {
+                    "eps_ttm": eps_ttm,
+                    "bps": bps,
+                }
+
+                # Build growth payload
+                result["growth"] = {
+                    "roe": roe_avg or roe_yearly,
+                    "gross_margin": gross_profit_ratio,
+                    "revenue_yoy": operate_income_yoy,
+                    "net_profit_yoy": holder_profit_yoy,
+                }
+
+                # Build earnings payload (financial report)
+                financial_report_payload = {
+                    "report_date": report_date,
+                    "revenue": operate_income,
+                    "net_profit_parent": holder_profit,
+                    "roe": roe_avg or roe_yearly,
+                }
+                if any(v is not None for v in financial_report_payload.values()):
+                    result["earnings"]["financial_report"] = financial_report_payload
+
+                result["source_chain"].append("financial_indicator:akshare_hk")
+                result["status"] = "partial"
+        except Exception as exc:
+            result["errors"].append(f"stock_financial_hk_analysis_indicator_em:{type(exc).__name__}")
+
+        # Try to get HK dividend data
+        try:
+            dividend_df = ak.stock_hk_dividend_payout_em(symbol=symbol)
+            if dividend_df is not None and not dividend_df.empty:
+                # Get recent dividend events
+                now_date = datetime.now().date()
+                ttm_start_date = now_date - timedelta(days=365)
+
+                dividend_events = []
+                ttm_total = 0.0
+
+                for _, row in dividend_df.iterrows():
+                    if not isinstance(row, pd.Series):
+                        continue
+
+                    # Try to parse dividend date
+                    date_col = next((c for c in row.index if any(k in str(c) for k in ("日期", "除息日", "派息日", "公告日"))), None)
+                    amount_col = next((c for c in row.index if any(k in str(c) for k in ("金额", "派息", "分红", "每股"))), None)
+
+                    if date_col is None or amount_col is None:
+                        continue
+
+                    event_date = _safe_datetime(row.get(date_col))
+                    per_share = _safe_float(row.get(amount_col))
+
+                    if event_date is None or per_share is None or per_share <= 0:
+                        continue
+
+                    event_date_str = event_date.date().isoformat()
+                    dividend_events.append({
+                        "event_date": event_date_str,
+                        "cash_dividend_per_share": per_share,
+                    })
+
+                    # Check if within TTM window
+                    if ttm_start_date <= event_date.date() <= now_date:
+                        ttm_total += per_share
+
+                if dividend_events:
+                    dividend_events.sort(key=lambda x: x.get("event_date", ""), reverse=True)
+                    result["earnings"]["dividend"] = {
+                        "events": dividend_events[:5],
+                        "ttm_cash_dividend_per_share": round(ttm_total, 6),
+                        "ttm_event_count": sum(1 for e in dividend_events if ttm_start_date <= datetime.fromisoformat(e["event_date"]).date() <= now_date),
+                        "coverage": "hk_dividend",
+                    }
+                    result["source_chain"].append("dividend:akshare_hk")
+        except Exception as exc:
+            result["errors"].append(f"stock_hk_dividend_payout_em:{type(exc).__name__}")
+
+        # Determine final status
+        has_content = bool(result["valuation"] or result["growth"] or result["earnings"])
+        result["status"] = "partial" if has_content else "not_supported"
+
+        return result
+
+    def _normalize_hk_code(self, stock_code: str) -> Optional[str]:
+        """Normalize HK stock code to 5-digit format."""
+        code = _safe_str(stock_code).upper()
+        # Remove HK prefix
+        if code.startswith("HK"):
+            code = code[2:]
+        # Must be 5-digit HK stock code
+        if not re.match(r"^\d{5}$", code):
+            return None
+        return code
+
+
+logger = logging.getLogger(__name__)
